@@ -17,6 +17,19 @@ Deletion uses `git branch -d`, so git refuses to delete branches that aren't mer
 
 Needs Python 3 and git. No other dependencies.
 
-Install: copy `stale-branches` somewhere on your PATH and make it executable (`chmod +x stale-branches`).
+## Install
 
-License: MIT, see LICENSE.
+macOS and Linux: copy `stale-branches` somewhere on your PATH and make it executable:
+
+    chmod +x stale-branches
+    ./stale-branches
+
+Windows: there is no executable bit, so run it through Python:
+
+    python stale-branches --keep main
+
+Tested on Linux and Windows (Python 3.13, git 2.55). Not tested on macOS yet.
+
+## License
+
+MIT, see LICENSE.

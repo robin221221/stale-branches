@@ -18,7 +18,10 @@ SEP = "\x1f"  # unit separator, safe inside git's --format output
 
 
 def git(*args, check=True):
-    result = subprocess.run(["git", *args], capture_output=True, text=True)
+    # git writes UTF-8 for branch and author names; Windows would otherwise
+    # decode with the console code page and choke on Cyrillic or other scripts
+    result = subprocess.run(["git", *args], capture_output=True,
+                            encoding="utf-8", errors="replace")
     if check and result.returncode != 0:
         sys.exit(f"git {' '.join(args)} failed: {result.stderr.strip()}")
     return result
@@ -27,7 +30,9 @@ def git(*args, check=True):
 def local_branches():
     out = git(
         "for-each-ref",
-        f"--format=%(refname:short){SEP}%(committerdate:unix){SEP}%(authorname)",
+        # lstrip=2 gives the plain branch name; :short can return "heads/x"
+        # when a tag or remote with the same name exists, and -d would fail
+        f"--format=%(refname:lstrip=2){SEP}%(committerdate:unix){SEP}%(authorname)",
         "refs/heads",
     ).stdout
     for line in out.splitlines():
@@ -36,6 +41,9 @@ def local_branches():
 
 
 def main():
+    # When stdout is a pipe or file, Windows Python falls back to the locale code
+    # page (cp1251/cp866 on Russian systems), so Cyrillic names come out garbled
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(
         description="List or delete local git branches idle for a while."
     )
@@ -48,7 +56,11 @@ def main():
     args = parser.parse_args()
 
     git("rev-parse", "--is-inside-work-tree")  # exits with a clear error outside a repo
-    current = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    # symbolic-ref gives the full ref, so names are never shortened or ambiguous;
+    # on a detached HEAD it fails, and then no branch is "current"
+    head = git("symbolic-ref", "-q", "HEAD", check=False)
+    ref = head.stdout.strip() if head.returncode == 0 else ""
+    current = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else None
     now = time.time()
     limit = args.days * 86400
 
