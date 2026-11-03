@@ -4,6 +4,7 @@
   stale-branches              # branches idle for 30+ days
   stale-branches --days 90    # custom threshold
   stale-branches --delete     # ask before deleting each one (uses git branch -d)
+  stale-branches --keep main --keep staging   # never list or delete these
 
 Deletion uses `git branch -d`, so git refuses to delete unmerged branches.
 Nothing is ever force-deleted.
@@ -42,6 +43,8 @@ def main():
                         help="idle threshold in days (default: 30)")
     parser.add_argument("--delete", action="store_true",
                         help="ask before deleting each stale branch")
+    parser.add_argument("--keep", action="append", default=[], metavar="BRANCH",
+                        help="never list or delete this branch (repeatable)")
     args = parser.parse_args()
 
     git("rev-parse", "--is-inside-work-tree")  # exits with a clear error outside a repo
@@ -51,7 +54,7 @@ def main():
 
     stale = sorted(
         ((name, ts, author) for name, ts, author in local_branches()
-         if name != current and now - ts > limit),
+         if name != current and name not in args.keep and now - ts > limit),
         key=lambda b: b[1],
     )
 
@@ -67,7 +70,11 @@ def main():
         return
 
     for name, _, _ in stale:
-        answer = input(f"Delete '{name}'? [y/N] ").strip().lower()
+        try:
+            answer = input(f"Delete '{name}'? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
         if answer != "y":
             continue
         result = git("branch", "-d", name, check=False)
