@@ -4,7 +4,10 @@
   stale-branches              # branches idle for 30+ days
   stale-branches --days 90    # custom threshold
   stale-branches --delete     # ask before deleting each one (uses git branch -d)
-  stale-branches --keep main --keep staging   # never list or delete these
+  stale-branches --keep staging --keep release   # never list or delete these
+
+main, master, develop and the remote's default branch are always kept, as are
+the current branch and branches checked out in other worktrees.
 
 Deletion uses `git branch -d`, so git refuses to delete unmerged branches.
 Nothing is ever force-deleted.
@@ -15,13 +18,17 @@ import sys
 import time
 
 SEP = "\x1f"  # unit separator, safe inside git's --format output
+ALWAYS_KEEP = ("main", "master", "develop")
 
 
 def git(*args, check=True):
     # git writes UTF-8 for branch and author names; Windows would otherwise
     # decode with the console code page and choke on Cyrillic or other scripts
-    result = subprocess.run(["git", *args], capture_output=True,
-                            encoding="utf-8", errors="replace")
+    try:
+        result = subprocess.run(["git", *args], capture_output=True,
+                                encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        sys.exit("stale-branches: git not found, install it and make sure it is on PATH")
     if check and result.returncode != 0:
         sys.exit(f"git {' '.join(args)} failed: {result.stderr.strip()}")
     return result
@@ -31,42 +38,89 @@ def local_branches():
     out = git(
         "for-each-ref",
         # lstrip=2 gives the plain branch name; :short can return "heads/x"
-        # when a tag or remote with the same name exists, and -d would fail
-        f"--format=%(refname:lstrip=2){SEP}%(committerdate:unix){SEP}%(authorname)",
+        # when a tag or remote with the same name exists, and -d would fail.
+        # Committer (not author) name, so it matches the committer date even
+        # after a rebase or cherry-pick.
+        f"--format=%(refname:lstrip=2){SEP}%(committerdate:unix){SEP}%(committername)",
         "refs/heads",
     ).stdout
     for line in out.splitlines():
-        name, ts, author = line.split(SEP, 2)
-        yield name, int(ts), author
+        name, ts, committer = line.split(SEP, 2)
+        yield name, int(ts), committer
+
+
+def default_branches():
+    """main/master/develop plus whatever origin/HEAD points to."""
+    names = set(ALWAYS_KEEP)
+    head = git("symbolic-ref", "-q", "refs/remotes/origin/HEAD", check=False)
+    ref = head.stdout.strip()
+    if head.returncode == 0 and ref.startswith("refs/remotes/origin/"):
+        names.add(ref[len("refs/remotes/origin/"):])
+    return names
+
+
+def worktree_branches():
+    """Branches checked out in any worktree; git branch -d refuses to delete them."""
+    out = git("worktree", "list", "--porcelain", check=False).stdout
+    prefix = "branch refs/heads/"
+    return {line[len(prefix):] for line in out.splitlines() if line.startswith(prefix)}
+
+
+def positive_days(value):
+    try:
+        days = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a whole number of days, got {value!r}")
+    if days < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
+    return days
+
+
+def git_error(stderr):
+    """First meaningful line of a git error, without the multi-line hints."""
+    for line in stderr.splitlines():
+        line = line.strip()
+        if line and not line.startswith("hint:"):
+            return line[len("error: "):] if line.startswith("error: ") else line
+    return "unknown error"
 
 
 def main():
-    # When stdout is a pipe or file, Windows Python falls back to the locale code
+    # When output is a pipe or file, Windows Python falls back to the locale code
     # page (cp1251/cp866 on Russian systems), so Cyrillic names come out garbled
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(
         description="List or delete local git branches idle for a while."
     )
-    parser.add_argument("--days", type=int, default=30,
+    parser.add_argument("--days", type=positive_days, default=30,
                         help="idle threshold in days (default: 30)")
     parser.add_argument("--delete", action="store_true",
                         help="ask before deleting each stale branch")
     parser.add_argument("--keep", action="append", default=[], metavar="BRANCH",
-                        help="never list or delete this branch (repeatable)")
+                        help="never list or delete this branch (repeatable); "
+                             "main, master, develop and the remote's default "
+                             "branch are always kept")
     args = parser.parse_args()
 
-    git("rev-parse", "--is-inside-work-tree")  # exits with a clear error outside a repo
+    if git("rev-parse", "--git-dir", check=False).returncode != 0:
+        sys.exit("stale-branches: not inside a git repository")
     # symbolic-ref gives the full ref, so names are never shortened or ambiguous;
     # on a detached HEAD it fails, and then no branch is "current"
     head = git("symbolic-ref", "-q", "HEAD", check=False)
     ref = head.stdout.strip() if head.returncode == 0 else ""
     current = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else None
+
+    keep = default_branches() | worktree_branches() | set(args.keep)
+    if current:
+        keep.add(current)
     now = time.time()
     limit = args.days * 86400
 
     stale = sorted(
-        ((name, ts, author) for name, ts, author in local_branches()
-         if name != current and name not in args.keep and now - ts > limit),
+        ((name, ts, committer) for name, ts, committer in local_branches()
+         if name not in keep and now - ts > limit),
         key=lambda b: b[1],
     )
 
@@ -74,9 +128,9 @@ def main():
         print(f"No local branches idle for {args.days}+ days.")
         return
 
-    for name, ts, author in stale:
+    for name, ts, committer in stale:
         idle_days = int((now - ts) // 86400)
-        print(f"{name:40} idle {idle_days:5} days  last commit by {author}")
+        print(f"{name:40} idle {idle_days:5} days  last commit by {committer}")
 
     if not args.delete:
         return
@@ -84,17 +138,21 @@ def main():
     for name, _, _ in stale:
         try:
             answer = input(f"Delete '{name}'? [y/N] ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:  # stdin closed or not interactive: stop asking
             print()
             return
-        if answer != "y":
+        if answer not in ("y", "yes"):
             continue
         result = git("branch", "-d", name, check=False)
         if result.returncode == 0:
             print(f"  deleted {name}")
         else:
-            print(f"  skipped {name}: {result.stderr.strip()}")
+            print(f"  skipped {name}: {git_error(result.stderr)}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)
