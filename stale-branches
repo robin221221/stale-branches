@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""stale-branches: list local git branches with no commits for N days.
+
+  stale-branches              # branches idle for 30+ days
+  stale-branches --days 90    # custom threshold
+  stale-branches --delete     # ask before deleting each one (uses git branch -d)
+
+Deletion uses `git branch -d`, so git refuses to delete unmerged branches.
+Nothing is ever force-deleted.
+"""
+import argparse
+import subprocess
+import sys
+import time
+
+SEP = "\x1f"  # unit separator, safe inside git's --format output
+
+
+def git(*args, check=True):
+    result = subprocess.run(["git", *args], capture_output=True, text=True)
+    if check and result.returncode != 0:
+        sys.exit(f"git {' '.join(args)} failed: {result.stderr.strip()}")
+    return result
+
+
+def local_branches():
+    out = git(
+        "for-each-ref",
+        f"--format=%(refname:short){SEP}%(committerdate:unix){SEP}%(authorname)",
+        "refs/heads",
+    ).stdout
+    for line in out.splitlines():
+        name, ts, author = line.split(SEP, 2)
+        yield name, int(ts), author
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="List or delete local git branches idle for a while."
+    )
+    parser.add_argument("--days", type=int, default=30,
+                        help="idle threshold in days (default: 30)")
+    parser.add_argument("--delete", action="store_true",
+                        help="ask before deleting each stale branch")
+    args = parser.parse_args()
+
+    git("rev-parse", "--is-inside-work-tree")  # exits with a clear error outside a repo
+    current = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    now = time.time()
+    limit = args.days * 86400
+
+    stale = sorted(
+        ((name, ts, author) for name, ts, author in local_branches()
+         if name != current and now - ts > limit),
+        key=lambda b: b[1],
+    )
+
+    if not stale:
+        print(f"No local branches idle for {args.days}+ days.")
+        return
+
+    for name, ts, author in stale:
+        idle_days = int((now - ts) // 86400)
+        print(f"{name:40} idle {idle_days:5} days  last commit by {author}")
+
+    if not args.delete:
+        return
+
+    for name, _, _ in stale:
+        answer = input(f"Delete '{name}'? [y/N] ").strip().lower()
+        if answer != "y":
+            continue
+        result = git("branch", "-d", name, check=False)
+        if result.returncode == 0:
+            print(f"  deleted {name}")
+        else:
+            print(f"  skipped {name}: {result.stderr.strip()}")
+
+
+if __name__ == "__main__":
+    main()
